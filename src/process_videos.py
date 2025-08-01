@@ -102,7 +102,7 @@ def get_filename(path):
 def mark_as_downloaded(filename):
     """Mark a file as downloaded."""
     with open(DOWNLOADED_FILE, 'a') as f:
-        f.write(f"{filename}\n")
+        f.write(f"\n{filename}")  # Add newline before the filename
 
 def is_file_complete(filename: str, expected_size: int) -> bool:
     """Check if a file is completely downloaded."""
@@ -132,54 +132,23 @@ async def download_video(session, url, filename, retry_count: int = 0) -> bool:
     start_time = time.time()
     last_speed_check = start_time
     last_bytes_downloaded = 0
+    last_progress_time = start_time
     
     try:
-        logger.info(f"Attempting to download {filename} from {url} (attempt {retry_count + 1}/{MAX_RETRIES})")
+        logger.info(f"Starting download of {filename}")
         
         # Add delay between downloads to avoid rate limiting
         if retry_count == 0:  # Only on first attempt
             logger.info(f"Waiting {RATE_LIMIT_DELAY} seconds before starting download...")
             await asyncio.sleep(RATE_LIMIT_DELAY)
         
-        # Check network connectivity before attempting download
-        if not await check_network_connectivity():
-            logger.error("Network connectivity check failed, will retry")
-            if retry_count < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-                return await download_video(session, url, filename, retry_count + 1)
-            return False
-
-        # Get expected file size
-        expected_size = await get_expected_file_size(url, session)
-        if expected_size:
-            logger.info(f"Expected file size for {filename}: {expected_size} bytes")
-            
-            # Check if file exists and is incomplete
-            if os.path.exists(output_path):
-                actual_size = os.path.getsize(output_path)
-                if actual_size > 0 and actual_size < expected_size:
-                    logger.warning(f"Found incomplete file: {filename} (size: {actual_size}, expected: {expected_size})")
-                    # Remove from downloaded.txt if it exists
-                    if filename in get_downloaded_files():
-                        with open(DOWNLOADED_FILE, 'r') as f:
-                            lines = f.readlines()
-                        with open(DOWNLOADED_FILE, 'w') as f:
-                            for line in lines:
-                                if line.strip() != filename:
-                                    f.write(line)
-                    # Delete incomplete file
-                    os.remove(output_path)
-        
         timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
         async with session.get(url, timeout=timeout) as response:
-            # Log response headers for rate limit detection
-            logger.info(f"Response headers for {filename}: {dict(response.headers)}")
-            
             if response.status == 200:
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded = 0
-                last_progress_time = time.time()
                 last_progress = 0
+                stall_count = 0  # Track number of consecutive stalls
                 
                 with open(output_path, 'wb') as f:
                     while True:
@@ -193,7 +162,7 @@ async def download_video(session, url, filename, retry_count: int = 0) -> bool:
                             f.write(chunk)
                             downloaded += len(chunk)
                             
-                            # Speed monitoring
+                            # Speed monitoring - less aggressive
                             current_time = time.time()
                             if current_time - last_speed_check >= SPEED_CHECK_INTERVAL:
                                 bytes_since_last_check = downloaded - last_bytes_downloaded
@@ -201,8 +170,18 @@ async def download_video(session, url, filename, retry_count: int = 0) -> bool:
                                 logger.info(f"Download speed for {filename}: {speed/1024:.2f} KB/s")
                                 
                                 if speed < MIN_SPEED_BYTES_PER_SECOND:
-                                    logger.warning(f"Download speed too slow for {filename}: {speed/1024:.2f} KB/s")
-                                    raise asyncio.TimeoutError("Download speed too slow")
+                                    stall_count += 1
+                                    logger.warning(f"Download speed too slow for {filename}: {speed/1024:.2f} KB/s (stall count: {stall_count})")
+                                    
+                                    # Only fail if we've stalled multiple times
+                                    if stall_count >= 3:
+                                        file_sizes = get_expected_sizes()
+                                        expected_size = file_sizes.get(filename)
+                                        if expected_size and downloaded < expected_size:
+                                            logger.error(f"Download stalled multiple times for {filename}: got {downloaded} bytes, expected {expected_size}")
+                                            raise asyncio.TimeoutError("Download stalled multiple times")
+                                else:
+                                    stall_count = 0  # Reset stall count if speed is good
                                 
                                 last_speed_check = current_time
                                 last_bytes_downloaded = downloaded
@@ -216,20 +195,19 @@ async def download_video(session, url, filename, retry_count: int = 0) -> bool:
                                     last_progress = progress
                                     last_progress_time = current_time
                                     logger.info(f"Download progress for {filename}: {int(progress)}% (elapsed: {int(current_time - start_time)}s)")
+                                elif current_time - last_progress_time > CHUNK_TIMEOUT:
+                                    # No progress for too long, check if we're stalled
+                                    file_sizes = get_expected_sizes()
+                                    expected_size = file_sizes.get(filename)
+                                    if expected_size and downloaded < expected_size:
+                                        stall_count += 1
+                                        logger.error(f"Download stalled for {filename}: got {downloaded} bytes, expected {expected_size} (stall count: {stall_count})")
+                                        if stall_count >= 3:
+                                            raise asyncio.TimeoutError("Download stalled multiple times")
                         except asyncio.TimeoutError:
                             logger.error(f"Chunk download timeout for {filename}")
                             raise
 
-                # Verify download size if we had an expected size
-                if expected_size and downloaded != expected_size:
-                    logger.error(f"Download incomplete for {filename}: got {downloaded} bytes, expected {expected_size}")
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    if retry_count < MAX_RETRIES - 1:
-                        await asyncio.sleep(RETRY_DELAY)
-                        return await download_video(session, url, filename, retry_count + 1)
-                    return False
-                
                 logger.info(f"Successfully downloaded {filename}")
                 mark_as_downloaded(filename)
                 return True
@@ -245,19 +223,15 @@ async def download_video(session, url, filename, retry_count: int = 0) -> bool:
                 return False
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.error(f"Network error downloading {filename}: {str(e)}")
-        logger.error(f"Full error details: {traceback.format_exc()}")
         if retry_count < MAX_RETRIES - 1:
-            logger.info(f"Retrying download of {filename} in {RETRY_DELAY} seconds...")
-            await asyncio.sleep(RETRY_DELAY)
+            # Exponential backoff for retries
+            retry_delay = RETRY_DELAY * (2 ** retry_count)
+            logger.info(f"Retrying download of {filename} in {retry_delay} seconds...")
+            await asyncio.sleep(retry_delay)
             return await download_video(session, url, filename, retry_count + 1)
-        logger.error(f"Max retries reached for {filename}")
-        return False
-    except IOError as e:
-        logger.error(f"File system error downloading {filename}: {str(e)}")
         return False
     except Exception as e:
         logger.error(f"Unexpected error downloading {filename}: {str(e)}")
-        logger.error(f"Full error details: {traceback.format_exc()}")
         return False
 
 async def download_videos(limit: Optional[int] = None) -> None:
@@ -288,32 +262,28 @@ async def download_videos(limit: Optional[int] = None) -> None:
     else:
         logger.info(f"Downloading {len(video_urls)} videos")
     
-    # First, get all file sizes with rate limiting
-    file_sizes = {}
-    timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout for HEAD requests
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
+    # Create a semaphore to limit concurrent downloads
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        for url in video_urls:
+    async def download_with_semaphore(url):
+        async with semaphore:
             filename = get_filename(url)
-            size = await get_expected_file_size(url, session)
-            if size:
-                file_sizes[filename] = size
-                logger.info(f"Got size for {filename}: {size} bytes")
-            await asyncio.sleep(RATE_LIMIT_DELAY)  # Rate limit the HEAD requests
+            return await download_video(session, url, filename)
     
-    # Now download files with higher concurrency
+    # Start downloads with rate limiting
     timeout = aiohttp.ClientTimeout(total=None)  # No timeout for the session
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_DOWNLOADS)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        tasks = []
-        for url in video_urls:
-            filename = get_filename(url)
-            task = asyncio.create_task(download_video(session, url, filename))
-            tasks.append(task)
-        
-        # Wait for all downloads to complete
-        await asyncio.gather(*tasks)
+        # Process videos in batches
+        for i in range(0, len(video_urls), MAX_CONCURRENT_DOWNLOADS):
+            batch = video_urls[i:i + MAX_CONCURRENT_DOWNLOADS]
+            tasks = [download_with_semaphore(url) for url in batch]
+            await asyncio.gather(*tasks)
+            
+            # Add a delay between batches to avoid overwhelming the server
+            if i + MAX_CONCURRENT_DOWNLOADS < len(video_urls):
+                logger.info(f"Waiting {RATE_LIMIT_DELAY} seconds before starting next batch...")
+                await asyncio.sleep(RATE_LIMIT_DELAY)
 
 async def main():
     """Main entry point."""
