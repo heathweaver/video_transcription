@@ -7,7 +7,12 @@ from typing import Optional
 
 # Add parent directory to path to import transcribe
 sys.path.append(str(Path(__file__).parent.parent))
-from transcribe import transcribe_audio
+from transcribe import (
+    transcribe_audio, 
+    transcribe_audio_with_timestamps, 
+    format_transcription_with_timestamps,
+    transcribe_with_speaker_diarization
+)
 
 # Set up logging
 logging.basicConfig(
@@ -21,6 +26,8 @@ DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', '/data/videos')
 TRANSCRIPT_DIR = os.getenv('TRANSCRIPT_DIR', '/data/transcripts')
 TRACKING_DIR = os.getenv('TRACKING_DIR', '/data/tracking')
 MODEL_SIZE = os.getenv('WHISPER_MODEL', 'base')
+WITH_TIMESTAMPS = os.getenv('WITH_TIMESTAMPS', 'false').lower() == 'true'
+WITH_SPEAKERS = os.getenv('WITH_SPEAKERS', 'false').lower() == 'true'
 DOWNLOADED_FILE = os.path.join(TRACKING_DIR, 'downloaded.txt')
 
 def get_downloaded_files():
@@ -43,9 +50,18 @@ def process_video(filename):
     try:
         logger.info(f"Starting transcription of {filename}")
         logger.info(f"Using model size: {MODEL_SIZE}")
+        logger.info(f"With timestamps: {WITH_TIMESTAMPS}")
+        logger.info(f"With speakers: {WITH_SPEAKERS}")
         
-        # Use the existing transcribe function
-        transcription = transcribe_audio(video_path, MODEL_SIZE)
+        # Use the appropriate transcribe function based on settings
+        if WITH_SPEAKERS:
+            # Use the integrated whisper-diarization pipeline
+            transcription = transcribe_with_speaker_diarization(video_path, MODEL_SIZE, quiet=True)
+        elif WITH_TIMESTAMPS:
+            result = transcribe_audio_with_timestamps(video_path, MODEL_SIZE, quiet=True)
+            transcription = format_transcription_with_timestamps(result)
+        else:
+            transcription = transcribe_audio(video_path, MODEL_SIZE, quiet=True)
         
         # Save the transcript
         with open(transcript_path, 'w', encoding='utf-8') as f:
